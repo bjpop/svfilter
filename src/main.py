@@ -100,25 +100,25 @@ def parse_chrom_colon_pos(text):
     # Exit the program if we can't parse the coordinate
     exit("Badly formated genomic coordinate: {}".format(text))
 
+
+def find_intersections(target_coords, record, chrom, pos1, pos2):
+    '''Filter a record based on its coordinates.'''
+    if chrom in target_coords:
+        chrom_targets = target_coords[chrom]
+        intersections = chrom_targets.find(pos1, pos2)
+        if len(intersections) > 0:
+            return set(intersections) 
+    return set() 
+
 class Socrates(object):
     def __init__(self, target_coords):
         self.target_coords = target_coords
 
 
     def sample_annotate(self, sample, record):
+        '''Append the sample id to a record'''
         record.append(sample)
         yield record
-
-
-    def find_intersections(self, record, chrom, pos1, pos2):
-        '''Filter a record based on its coordinates.'''
-        if chrom in self.target_coords:
-            chrom_targets = self.target_coords[chrom]
-            intersections = chrom_targets.find(pos1, pos2)
-            if len(intersections) > 0:
-                annotations = ','.join(intersections)
-                record.append(annotations)
-                yield record
 
 
     def coord_filter(self, record):
@@ -130,17 +130,19 @@ class Socrates(object):
         chrom2, pos2 = parse_chrom_colon_pos(c1_anchor)
         chrom3, pos3 = parse_chrom_colon_pos(c2_realign)
         chrom4, pos4 = parse_chrom_colon_pos(c2_anchor)
+        intersections = set()
   
         if chrom1 == chrom2:
             pos_low = min(pos1, pos2)
             pos_high = max(pos1, pos2)
-            for result in self.find_intersections(record, chrom1, pos_low, pos_high):
-                yield result 
+            intersections.update(find_intersections(self.target_coords, record, chrom1, pos_low, pos_high))
         else:
-            for result in self.find_intersections(record, chrom1, pos1, pos1):
-                yield result 
-            for result in self.find_intersections(record, chrom2, pos2, pos2):
-                yield result 
+            intersections.update(find_intersections(self.target_coords, record, chrom1, pos1, pos1))
+            intersections.update(find_intersections(self.target_coords, record, chrom2, pos2, pos2))
+
+        if len(intersections) > 0:
+            record.append(','.join(intersections))
+            yield record
 
 
 class VCF(object):
@@ -153,18 +155,8 @@ class VCF(object):
         yield record
 
 
-    def find_intersections(self, record, chrom, pos1, pos2):
-        '''Filter a record based on its coordinates.'''
-        if chrom in self.target_coords:
-            chrom_targets = self.target_coords[chrom]
-            intersections = chrom_targets.find(pos1, pos2)
-            if len(intersections) > 0:
-                annotations = ','.join(intersections)
-                record.INFO['hits'] = annotations
-                yield record
-    
-
     def coord_filter(self, record):
+        intersections = set()
         info = record.INFO
         svtype = info['SVTYPE']
         if svtype == 'BND':
@@ -179,14 +171,11 @@ class VCF(object):
                     # for the pair. 
                     pos_low = min(pos1, pos2)
                     pos_high = max(pos1, pos2)
-                    for result in self.find_intersections(record, chrom1, pos_low, pos_high):
-                        yield result 
+                    intersections.update(find_intersections(self.target_coords, record, chrom1, pos_low, pos_high))
                 else:
                     # Break ends are on different chromosomes.
-                    for result in self.find_intersections(record, chrom1, pos1, pos1):
-                        yield result 
-                    for result in self.find_intersections(record, chrom2, pos2, pos2):
-                        yield result 
+                    intersections.update(find_intersections(self.target_coords, record, chrom1, pos1, pos1))
+                    intersections.update(find_intersections(self.target_coords, record, chrom2, pos2, pos2))
         else:
             # INV, DEL, INS, DUP
             # These all happen on the same chromosome
@@ -196,8 +185,11 @@ class VCF(object):
                 end_pos = info['END']
             else:
                 end_pos = start_pos
-            for result in self.find_intersections(record, chrom, start_pos, end_pos):
-                yield result 
+            intersections.update(find_intersections(self.target_coords, record, chrom, start_pos, end_pos))
+
+        if len(intersections) > 0:
+            record.INFO['hits'] = ','.join(intersections) 
+            yield record
 
 
 def identity_filter(record):
@@ -223,7 +215,7 @@ def get_custom_filter(args):
 
 
 def run_filter(reader, writer, custom_filter, coord_filter, sample_annotate):
-    # apply the coord filter first then the custom filter
+    # apply the coord filter first then the custom filter, then sample annotator
     for record_1 in reader:
         for record_2 in coord_filter(record_1):
             for record_3 in custom_filter(record_2): 
