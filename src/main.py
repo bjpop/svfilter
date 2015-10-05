@@ -8,6 +8,8 @@ import logging
 import csv
 import re
 
+MAX_REPORTED_INTERSECTIONS = 10000 
+
 DEFAULT_LOG_FILE = "svfilter.log"
 
 def parse_args():
@@ -17,7 +19,7 @@ def parse_args():
     parser.add_argument(
         '--version', action='version', version='%(prog)s ' + version)
     parser.add_argument(
-        '--coords', required=False, type=str,
+        '--coords', required=False, type=str, metavar='COORDS',
         help='TSV coordinates file for region of interest')
     parser.add_argument(
         '--type', required=True, choices=['vcf', 'socrates'],
@@ -31,6 +33,12 @@ def parse_args():
     parser.add_argument(
         '--sample', metavar='STR', type=str,
         help='Sample identifier')
+    parser.add_argument(
+        '--filter', action='store_true',
+        help='Only keep variants which fall inside the bounds of COORDS')
+    parser.add_argument(
+        '--annotate', action='store_true',
+        help='Annotate each output variant with a list of all the features from COORDS that it intersects')
     parser.add_argument(
         'variants', metavar='FILE', type=str,
         help='Input file containing variant calls')
@@ -61,21 +69,17 @@ def get_target_coords(coords_filename):
     for each coordinate span in the input file.''' 
     result = {}
     with open(coords_filename) as coords_file:
-        for row in coords_file:
-            fields = row.split()
-            if len(fields) >= 3:
-                chrom, start, end = fields[0:3]
-                start = int(start)
-                end = int(end)
-                if len(fields) >= 4:
-                    annotation = fields[3]
-                else:
-                    annotation = None
-                if chrom in result:
-                    result[chrom].add(start, end, annotation)
-                else:
-                    result[chrom] = IntervalTree()
-                    result[chrom].add(start, end, annotation)
+        reader = csv.DictReader(coords_file, delimiter='\t')
+        for row in reader:
+            chrom = row['chrom']
+            start = int(row['start'])
+            end = int(row['end'])
+            annotation = row['name']
+            if chrom in result:
+                result[chrom].add(start, end, annotation)
+            else:
+                result[chrom] = IntervalTree()
+                result[chrom].add(start, end, annotation)
     return result
 
 def parse_bnd_alt(alt):
@@ -111,8 +115,10 @@ def find_intersections(target_coords, record, chrom, pos1, pos2):
     return set() 
 
 class Socrates(object):
-    def __init__(self, target_coords):
+    def __init__(self, target_coords, filter, annotate):
         self.target_coords = target_coords
+        self.filter = filter
+        self.annotate = annotate
 
 
     def sample_annotate(self, sample, record):
@@ -121,7 +127,7 @@ class Socrates(object):
         yield record
 
 
-    def coord_filter(self, record):
+    def coord_filter_annotate(self, record):
         c1_realign = record[0]
         c1_anchor = record[3]
         c2_realign = record[12]
@@ -140,14 +146,29 @@ class Socrates(object):
             intersections.update(find_intersections(self.target_coords, record, chrom1, pos1, pos1))
             intersections.update(find_intersections(self.target_coords, record, chrom2, pos2, pos2))
 
-        if len(intersections) > 0:
-            record.append(','.join(intersections))
+        num_intersections = len(intersections)
+
+        if self.annotate and num_intersections > 0:
+            reported_intersections = intersections
+            if num_intersections > MAX_REPORTED_INTERSECTIONS:
+                reported_intersections = list(intersections)[:MAX_REPORTED_INTERSECTIONS]
+                annotation = ','.join(reported_intersections) + " + {} more".format(num_intersections - MAX_REPORTED_INTERSECTIONS)
+            else:
+                annotation = ','.join(reported_intersections)
+            record.append(annotation)
+
+        if self.filter:
+            if num_intersections > 0:
+                yield record
+        else:
             yield record
 
 
 class VCF(object):
-    def __init__(self, target_coords):
+    def __init__(self, target_coords, filter, annotate):
         self.target_coords = target_coords
+        self.filter = filter
+        self.annotate = annotate
 
 
     def sample_annotate(self, sample, record):
@@ -155,41 +176,64 @@ class VCF(object):
         yield record
 
 
-    def coord_filter(self, record):
+    def coord_filter_annotate(self, record):
         intersections = set()
         info = record.INFO
-        svtype = info['SVTYPE']
-        if svtype == 'BND':
-            # Break end. These can happen on different chromosomes.
-            chrom1 = record.CHROM 
-            pos1 = record.POS
-            alt = record.ALT
-            for item in alt:
-                chrom2, pos2 = parse_bnd_alt(item)
-                if chrom1 == chrom2:
-                    # Both break ends are on the same chromosome, we assume one interval
-                    # for the pair. 
-                    pos_low = min(pos1, pos2)
-                    pos_high = max(pos1, pos2)
-                    intersections.update(find_intersections(self.target_coords, record, chrom1, pos_low, pos_high))
-                else:
-                    # Break ends are on different chromosomes.
-                    intersections.update(find_intersections(self.target_coords, record, chrom1, pos1, pos1))
-                    intersections.update(find_intersections(self.target_coords, record, chrom2, pos2, pos2))
-        else:
-            # INV, DEL, INS, DUP
-            # These all happen on the same chromosome
-            chrom = record.CHROM
-            start_pos = record.POS
-            if 'END' in info:
-                end_pos = info['END']
+        if 'SVTYPE' in info:
+            # this is a structural variant
+            svtype = info['SVTYPE']
+            if svtype == 'BND':
+                # Break end. These can happen on different chromosomes.
+                chrom1 = record.CHROM 
+                pos1 = record.POS
+                alt = record.ALT
+                for item in alt:
+                    chrom2, pos2 = parse_bnd_alt(item)
+                    if chrom1 == chrom2:
+                        # Both break ends are on the same chromosome, we assume one interval
+                        # for the pair. 
+                        pos_low = min(pos1, pos2)
+                        pos_high = max(pos1, pos2)
+                        intersections.update(find_intersections(self.target_coords, record, chrom1, pos_low, pos_high))
+                    else:
+                        # Break ends are on different chromosomes.
+                        intersections.update(find_intersections(self.target_coords, record, chrom1, pos1, pos1))
+                        intersections.update(find_intersections(self.target_coords, record, chrom2, pos2, pos2))
             else:
-                end_pos = start_pos
-            intersections.update(find_intersections(self.target_coords, record, chrom, start_pos, end_pos))
+                # This is INV, DEL, INS, DUP
+                # These all happen on the same chromosome
+                self.coord_filter_annoate_same_chrom(intersections, record)
+        else:
+            # This is a non-structural variant (SNP or indel) 
+            self.coord_filter_annoate_same_chrom(intersections, record)
 
-        if len(intersections) > 0:
-            record.INFO['hits'] = ','.join(intersections) 
+        num_intersections = len(intersections)
+
+        if self.annotate and num_intersections > 0:
+            reported_intersections = intersections
+            if num_intersections > MAX_REPORTED_INTERSECTIONS:
+                reported_intersections = list(intersections)[:MAX_REPORTED_INTERSECTIONS]
+                annotation = ','.join(reported_intersections) + " + {} more".format(num_intersections - MAX_REPORTED_INTERSECTIONS)
+            else:
+                annotation = ','.join(reported_intersections)
+            record.INFO['hits'] = annotation
+
+        if self.filter:
+            if num_intersections > 0:
+                yield record
+        else:
             yield record
+
+
+    def coord_filter_annoate_same_chrom(self, intersections, record):
+        info = record.INFO
+        chrom = record.CHROM
+        start_pos = record.POS
+        if 'END' in info:
+            end_pos = info['END']
+        else:
+            end_pos = start_pos
+        intersections.update(find_intersections(self.target_coords, record, chrom, start_pos, end_pos))
 
 
 def identity_filter(record):
@@ -214,10 +258,10 @@ def get_custom_filter(args):
     return custom_filter
 
 
-def run_filter(reader, writer, custom_filter, coord_filter, sample_annotate):
+def run_filter(reader, writer, custom_filter, coord_filter_annotate, sample_annotate):
     # apply the coord filter first then the custom filter, then sample annotator
     for record_1 in reader:
-        for record_2 in coord_filter(record_1):
+        for record_2 in coord_filter_annotate(record_1):
             for record_3 in custom_filter(record_2): 
                 for record_4 in sample_annotate(record_3):
                     writer(record_4)
@@ -230,15 +274,15 @@ def main():
     else:
         target_coords = None
     custom_filter = get_custom_filter(args)
-    coord_filter = identity_filter
+    coord_filter_annotate = identity_filter
     sample_annotate = identity_filter
     with open(args.variants) as variants_file:
         if args.type == 'vcf':
             reader = vcf.Reader(variants_file)
             writer = vcf.Writer(sys.stdout, reader).write_record
-            vcf_filter = VCF(target_coords)
+            vcf_filter = VCF(target_coords, args.filter, args.annotate)
             if target_coords is not None:
-                coord_filter = vcf_filter.coord_filter
+                coord_filter_annotate = vcf_filter.coord_filter_annotate
             if args.sample:
                 sample_annotate = lambda record: vcf_filter.sample_annotate(args.sample, record)
         elif args.type == 'socrates':
@@ -246,12 +290,12 @@ def main():
             # skip the header row
             reader.next()
             writer = csv.writer(sys.stdout, delimiter='\t').writerow
-            socrates_filter = Socrates(target_coords)
+            socrates_filter = Socrates(target_coords, args.filter, args.annotate)
             if target_coords is not None:
-                coord_filter = socrates_filter.coord_filter
+                coord_filter_annotate = socrates_filter.coord_filter_annotate
             if args.sample:
                 sample_annotate = lambda record: socrates_filter.sample_annotate(args.sample, record)
-        run_filter(reader, writer, custom_filter, coord_filter, sample_annotate)
+        run_filter(reader, writer, custom_filter, coord_filter_annotate, sample_annotate)
 
 if __name__ == "__main__":
     main()
