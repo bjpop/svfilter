@@ -199,6 +199,14 @@ class VCF(object):
                         # Break ends are on different chromosomes.
                         intersections.update(find_intersections(self.target_coords, record, chrom1, pos1, pos1))
                         intersections.update(find_intersections(self.target_coords, record, chrom2, pos2, pos2))
+            elif svtype == 'TRA':
+                chrom1 = record.CHROM
+                pos1 = record.POS
+                chrom2 = info['CHR2']
+                pos2 = int(info['END'])
+                # Break ends are on different chromosomes.
+                intersections.update(find_intersections(self.target_coords, record, chrom1, pos1, pos1))
+                intersections.update(find_intersections(self.target_coords, record, chrom2, pos2, pos2))
             else:
                 # This is INV, DEL, INS, DUP
                 # These all happen on the same chromosome
